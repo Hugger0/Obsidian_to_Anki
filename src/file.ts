@@ -1,5 +1,8 @@
 /*Performing plugin operations on markdown file contents*/
 
+import { Note, InlineNote, RegexNote, CLOZE_ERROR, NOTE_TYPE_ERROR, TAG_SEP, ID_REGEXP_STR, TAG_REGEXP_STR } from './note'
+// ... 其他 import 保持不变
+
 import { FROZEN_FIELDS_DICT } from './interfaces/field-interface'
 import { AnkiConnectNote, AnkiConnectNoteAndID } from './interfaces/note-interface'
 import { FileData } from './interfaces/settings-interface'
@@ -417,11 +420,79 @@ export class AllFile extends AbstractFile {
         }
     }
 
+    // 文件: src/file.ts, 在 AllFile 类的 scanFile() 方法中
     scanFile() {
         this.setupScan()
         this.scanNotes()
         this.scanInlineNotes()
-        for (let note_type in this.custom_regexps) {
+        
+        // =================================================================
+        // START: 【定制H2自动解析逻辑】
+        // =================================================================
+
+        // 目标 Note Type 必须是 Anki 中已有的卡片模板名称，例如 '问答题' 或 'Basic'
+        const TARGET_NOTE_TYPE: string = "问答题"; 
+        
+        // 我们之前验证过的 H2 正则表达式 (非贪婪匹配 H2 及其下的内容直到下一个 H2)
+        // match[1] = H2 标题 (正面), match[2] = H2 下的内容 (背面)
+        const H2_AUTO_REGEX = /(?s)^#{2} (.+)\n(.*?)(?=\n^## |\Z)/g;
+
+        // 确保该 Note Type 存在于 fields_dict 中，否则插件会报错
+        if (this.data.fields_dict.hasOwnProperty(TARGET_NOTE_TYPE)) {
+            
+            // 扫描文件并查找 H2 匹配项，忽略已经在 ignore_spans 中的内容
+            for (let match of findignore(H2_AUTO_REGEX, this.file, this.ignore_spans)) {
+                
+                // 1. 立即将匹配到的块添加到 ignore_spans 中，防止被后续的正则重复解析
+                this.ignore_spans.push([match.index, match.index + match[0].length]);
+                
+                // 2. 构建 RegexNote 所需的 'match' 数组
+                // 注意：match 数组的索引和长度必须与 RegexNote constructor 中对 tags/id 的处理逻辑对应
+                // 这里我们假设 tags 和 id 都是 false，所以只保留 match[0], match[1], match[2]
+                // 由于 RegexNote 构造函数会 pop 两次，我们必须传入包含 [full match, front, back, tag, id] 的数组
+                // 因为我们不从正则获取 tag/id，所以我们将它们设为空
+                const regexMatchArray: RegExpMatchArray = [
+                    match[0],    
+                    match[1],    
+                    match[2], 
+                    "", // 占位符: Tags 
+                    "", // 占位符: ID
+                ] as RegExpMatchArray;
+
+                // 3. 使用 RegexNote 类来格式化卡片
+                const parsed = new RegexNote(
+                    regexMatchArray, 
+                    TARGET_NOTE_TYPE, 
+                    this.data.fields_dict, 
+                    false, // search_tags: false 
+                    false, // search_id: false
+                    this.data.curly_cloze, 
+                    this.data.highlights_to_cloze, 
+                    this.formatter
+                ).parse(
+                    this.target_deck,
+                    this.url,
+                    this.frozen_fields_dict,
+                    this.data,
+                    this.data.add_context ? this.getContextAtIndex(match.index) : ""
+                );
+
+                // 4. 添加到新增卡片列表
+                parsed.note.tags.push(...this.global_tags.split(TAG_SEP));
+                this.regex_notes_to_add.push(parsed.note);
+                // 记录索引，用于后续写入 ID
+                this.regex_id_indexes.push(match.index + match[0].length);
+            }
+        } else {
+            // 可选：添加一个控制台警告，提示用户在 Anki 中创建该 Note Type
+            console.warn(`Anki Note Type "${TARGET_NOTE_TYPE}" not found. Please create it in Anki.`);
+        }
+        
+        // =================================================================
+        // END: 【定制H2自动解析逻辑】
+        // =================================================================
+        
+        for (let note_type in this.custom_regexps) { // 原本的自定义正则扫描
             const regexp_str: string = this.custom_regexps[note_type]
             if (regexp_str) {
                 this.search(note_type, regexp_str)
@@ -430,40 +501,3 @@ export class AllFile extends AbstractFile {
         this.all_notes_to_add = this.notes_to_add.concat(this.inline_notes_to_add).concat(this.regex_notes_to_add)
         this.scanDeletions()
     }
-
-    fix_newline_ids() {
-        this.file = this.file.replace(double_regexp, "$1")
-    }
-
-    writeIDs() {
-        let normal_inserts: [number, string][] = []
-        this.id_indexes.forEach(
-            (id_position: number, index: number) => {
-                const identifier: number | null = this.note_ids[index]
-                if (identifier) {
-                    normal_inserts.push([id_position, id_to_str(identifier, false, this.data.comment)])
-                }
-            }
-        )
-        let inline_inserts: [number, string][] = []
-        this.inline_id_indexes.forEach(
-            (id_position: number, index: number) => {
-                const identifier: number | null = this.note_ids[index + this.notes_to_add.length] //Since regular then inline
-                if (identifier) {
-                    inline_inserts.push([id_position, id_to_str(identifier, true, this.data.comment)])
-                }
-            }
-        )
-        let regex_inserts: [number, string][] = []
-        this.regex_id_indexes.forEach(
-            (id_position: number, index: number) => {
-                const identifier: number | null = this.note_ids[index + this.notes_to_add.length + this.inline_notes_to_add.length] // Since regular then inline then regex
-                if (identifier) {
-                    regex_inserts.push([id_position, "\n" + id_to_str(identifier, false, this.data.comment)])
-                }
-            }
-        )
-        this.file = string_insert(this.file, normal_inserts.concat(inline_inserts).concat(regex_inserts))
-        this.fix_newline_ids()
-    }
-}
